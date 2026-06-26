@@ -19,6 +19,12 @@ import base64
 import importlib
 import os
 import pathlib
+import sys
+
+# The package uses a src/ layout. Horizon installs third-party deps from
+# requirements.txt but not this local package, so put src/ on the path to make
+# `import garmin_mcp` work without a separate install step.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 # The token must exist on disk BEFORE importing garmin_mcp, which reads
 # GARMINTOKENS at import time. Materialize it from the env secret.
