@@ -1,11 +1,16 @@
 python-dotenv==1.2.2
 garminconnect==0.3.2
 requests==2.33.0
-mcp>=1.23.0
 fitparse>=1.2.0
-fastmcp>=2
-# fastmcp needs pydantic-settings at import time. Horizon's build image ships a
-# pre-baked fastmcp that already satisfies `fastmcp>=2`, so pip skips it and
-# never pulls this transitive dep — declare it explicitly so `fastmcp inspect`
-# can import fastmcp during the build.
+# Pin fastmcp AND mcp to a mutually-compatible, locally-verified pair.
+# Horizon's build image pre-bakes a fastmcp that satisfies loose ranges, so pip
+# skips reinstalling it and leaves a fastmcp/mcp mismatch — the pre-baked
+# fastmcp imports `McpError` while an unpinned `mcp` resolves to a version that
+# renamed it to `MCPError` (ImportError at `fastmcp inspect`). Exact pins force
+# a consistent set. `mcp` is only a transitive dep of fastmcp (the app code
+# imports fastmcp, not mcp), so it is safe to pin here.
+fastmcp==3.4.2
+mcp==1.28.1
+# fastmcp needs pydantic-settings at import; declare it explicitly in case the
+# pre-baked fastmcp is skipped and its transitive deps aren't reinstalled.
 pydantic-settings>=2
