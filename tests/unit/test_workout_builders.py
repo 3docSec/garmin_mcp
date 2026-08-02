@@ -1,6 +1,8 @@
 import json
 import os
 
+import pytest
+
 from garmin_mcp.workout_builders import (
     build_walk_run_json,
     build_z2_walk_json,
@@ -69,6 +71,48 @@ def test_build_run_json_structure():
     assert steps[2]["endConditionValue"] == 300.0
 
 
+def test_build_run_json_custom_hr_range():
+    """hr_min/hr_max should produce a custom bpm-range target, not a zoneNumber."""
+    result = build_run_json(
+        name="Base run - custom range",
+        run_seconds=1440,
+        warmup_min=5,
+        cooldown_min=5,
+        hr_min=136,
+        hr_max=148,
+    )
+    steps = result["workoutSegments"][0]["workoutSteps"]
+    interval_step = steps[1]
+    assert interval_step["targetType"]["workoutTargetTypeKey"] == "heart.rate.zone"
+    assert interval_step["targetValueOne"] == 136.0
+    assert interval_step["targetValueTwo"] == 148.0
+    assert "zoneNumber" not in interval_step
+    assert "136-148bpm" in result["description"]
+
+
+def test_build_run_json_custom_hr_range_requires_both_bounds():
+    with pytest.raises(ValueError, match="hr_min and hr_max must both be provided together"):
+        build_run_json(
+            name="Bad range",
+            run_seconds=1440,
+            warmup_min=5,
+            cooldown_min=5,
+            hr_min=136,
+        )
+
+
+def test_build_run_json_custom_hr_range_rejects_inverted_bounds():
+    with pytest.raises(ValueError, match="must be less than"):
+        build_run_json(
+            name="Bad range",
+            run_seconds=1440,
+            warmup_min=5,
+            cooldown_min=5,
+            hr_min=148,
+            hr_max=136,
+        )
+
+
 def test_build_strength_json_structure():
     result = build_strength_json(
         name="Full Body A",
@@ -85,3 +129,55 @@ def test_build_strength_json_structure():
     assert len(steps) == 3
     assert steps[0]["exerciseName"] == "Sentadillas"
     assert steps[2]["exerciseName"] == "Flexiones"
+
+
+# ---------------------------------------------------------------------------
+# Strength step categories
+#
+# Garmin validates "category" against its own enum. A value outside it — the
+# previously hardcoded "UNASSIGNED" — fails every upload with `400 - Invalid
+# category`, while omitting the key is accepted.
+# ---------------------------------------------------------------------------
+
+
+def _work_steps(result):
+    """Only the exercise steps; rest steps are recovery steps and carry no category."""
+    steps = result["workoutSegments"][0]["workoutSteps"]
+    return [s for s in steps if s["stepType"]["stepTypeKey"] == "interval"]
+
+
+def test_strength_omits_category_when_not_supplied():
+    result = build_strength_json(
+        name="No categories",
+        exercises=[
+            {"name": "Back Squat", "sets": 3, "reps": 5, "rest_seconds": 120},
+            {"name": "Zercher Whatever", "sets": 3, "reps": 8, "rest_seconds": 60},
+        ],
+    )
+    for step in _work_steps(result):
+        assert "category" not in step
+    # The name survives the Garmin round trip in the description, not exerciseName.
+    assert _work_steps(result)[0]["description"].startswith("Back Squat:")
+
+
+def test_strength_passes_through_supplied_category():
+    result = build_strength_json(
+        name="Mixed",
+        exercises=[
+            {"name": "Farmers Carry 40m", "sets": 3, "reps": 1, "category": "carry"},
+            {"name": "Back Squat", "sets": 3, "reps": 5},
+        ],
+    )
+    first, second = _work_steps(result)
+    assert first["category"] == "CARRY"
+    assert first["exerciseName"] == "Farmers Carry 40m"
+    assert "category" not in second
+
+
+def test_strength_rejects_empty_category():
+    for bad in ("", "   ", 5):
+        with pytest.raises(ValueError):
+            build_strength_json(
+                name="Bad",
+                exercises=[{"name": "Back Squat", "sets": 1, "reps": 1, "category": bad}],
+            )

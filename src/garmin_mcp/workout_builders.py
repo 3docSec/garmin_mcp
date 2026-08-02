@@ -45,22 +45,54 @@ def _zone_number(zone: str) -> int:
     raise ValueError(f"Invalid hr_zone '{zone}'. Use Z1-Z5 or 1-5.")
 
 
+def _hr_target(
+    hr_zone: str,
+    hr_min: Optional[int],
+    hr_max: Optional[int],
+) -> tuple:
+    """Resolve HR target fields and a short description suffix.
+
+    Returns (target_extra_fields, description_suffix). If hr_min/hr_max are
+    both given, builds a custom bpm-range target (targetValueOne/targetValueTwo)
+    instead of a named Garmin zone. A custom range and a named zone are mutually
+    exclusive -- if a range is given, hr_zone is ignored.
+    """
+    if hr_min is not None or hr_max is not None:
+        if hr_min is None or hr_max is None:
+            raise ValueError("hr_min and hr_max must both be provided together.")
+        if hr_min >= hr_max:
+            raise ValueError(f"hr_min ({hr_min}) must be less than hr_max ({hr_max}).")
+        return (
+            {"targetValueOne": float(hr_min), "targetValueTwo": float(hr_max)},
+            f"{hr_min}-{hr_max}bpm",
+        )
+    zone = _zone_number(hr_zone)
+    return ({"zoneNumber": zone}, f"Z{zone}")
+
+
 def build_run_json(
     name: str,
     run_seconds: int,
     warmup_min: int,
     cooldown_min: int,
     hr_zone: str = "Z3",
+    hr_min: Optional[int] = None,
+    hr_max: Optional[int] = None,
 ) -> dict:
-    """Build the Garmin Connect JSON for a continuous run workout."""
-    zone = _zone_number(hr_zone)
+    """Build the Garmin Connect JSON for a continuous run workout.
+
+    Targets a named heart-rate zone (hr_zone) by default. Pass hr_min and
+    hr_max together to target an exact custom bpm range instead (e.g. a
+    136-148 bpm range that doesn't line up with any single Garmin zone).
+    """
+    hr_target_fields, hr_desc = _hr_target(hr_zone, hr_min, hr_max)
     run_display = (
         f"{run_seconds // 60}m" if run_seconds % 60 == 0 else f"{run_seconds}s"
     )
     return {
         "workoutName": name,
         "description": (
-            f"{warmup_min}m warmup + {run_display} run Z{zone} + {cooldown_min}m cooldown"
+            f"{warmup_min}m warmup + {run_display} run {hr_desc} + {cooldown_min}m cooldown"
         ),
         "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
         "workoutSegments": [{
@@ -80,11 +112,11 @@ def build_run_json(
                     "type": "ExecutableStepDTO",
                     "stepOrder": 2,
                     "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
-                    "description": f"Run {run_seconds}s Z{zone}",
+                    "description": f"Run {run_seconds}s {hr_desc}",
                     "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
                     "endConditionValue": float(run_seconds),
                     "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
-                    "zoneNumber": zone,
+                    **hr_target_fields,
                 },
                 {
                     "type": "ExecutableStepDTO",
@@ -223,19 +255,23 @@ def build_z2_walk_json(
     }
 
 
-# Simplified internal exercise catalog (English → Garmin exerciseName key or fallback)
-# Garmin strength workouts use exerciseName as a free-text label when the exercise
-# is not in their catalog. For structured strength, we use "Other" (generic) and
-# put the user name in description / exerciseName.
-
 def build_strength_json(
     name: str,
     exercises: List[Dict[str, Any]],
 ) -> dict:
     """Build the Garmin Connect JSON for a strength workout.
 
-    Each exercise maps to a generic step; if the name is not recognised in the
-    Garmin catalog we use 'Other' and put the original name in exerciseName.
+    Each exercise becomes a reps-based work step. The name is preserved in the step
+    "description", which is what survives the round trip. It is also sent as
+    "exerciseName", but Garmin only retains that when it matches one of its own
+    exercise keys (e.g. "FARMERS_CARRY"); any other value is accepted and then
+    stored as an empty string.
+
+    "category" is optional and only emitted when the caller supplies one, uppercased
+    and otherwise passed through untouched. Garmin validates it against its own enum
+    and rejects anything outside it, including "UNASSIGNED" and "OTHER"; omitting the
+    key is accepted. Valid values come from Garmin's published catalog:
+    https://connect.garmin.com/web-data/exercises/Exercises.json
     """
     steps: List[dict] = []
     step_order = 1
@@ -247,16 +283,29 @@ def build_strength_json(
         rest_seconds = int(ex.get("rest_seconds", 60))
 
         # Work step
-        steps.append({
+        step = {
             "type": "ExecutableStepDTO",
             "stepOrder": step_order,
             "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
             "description": f"{ex_name}: {sets} sets x {reps} reps",
-            "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
-            "endConditionValue": float(sets * 45),  # rough estimate: 45s per set
+            "endCondition": {"conditionTypeId": 10, "conditionTypeKey": "reps"},
+            "endConditionValue": float(reps),
             "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
             "exerciseName": ex_name,
-        })
+        }
+
+        # Only set when the caller asked for it: Garmin rejects values outside its own
+        # enum, and an absent category is accepted, so an unknown one stays absent
+        # rather than being guessed into a wrong record.
+        category = ex.get("category")
+        if category is not None:
+            if not isinstance(category, str) or not category.strip():
+                raise ValueError(
+                    f"category for exercise {ex_name!r} must be a non-empty string"
+                )
+            step["category"] = category.strip().upper()
+
+        steps.append(step)
         step_order += 1
 
         # Rest step (skip after last exercise)
@@ -346,17 +395,28 @@ def register_tools(app):
         warmup_min: int,
         cooldown_min: int,
         hr_zone: str = "Z3",
+        hr_min: Optional[int] = None,
+        hr_max: Optional[int] = None,
     ) -> str:
         """Create a continuous run workout and upload it to Garmin Connect.
 
         Builds a single uninterrupted run interval with warmup and cooldown walks.
+
+        Targets a named Garmin heart-rate zone by default. Named zones (Z1-Z5)
+        don't line up with every real training target -- e.g. a 136-148 bpm
+        Zone 2 goal straddles Garmin's Z2 (118-137) and Z3 (138-157). Pass
+        hr_min and hr_max together to target that exact bpm range instead;
+        the watch will then show "in range" only for the range you actually
+        want, not a whole zone that over- or under-shoots it.
 
         Args:
             name: Workout name (e.g. "Step 8 - 30min continuous")
             run_seconds: Duration of the run in seconds
             warmup_min: Warmup walk duration in minutes
             cooldown_min: Cooldown walk duration in minutes
-            hr_zone: Target heart-rate zone (Z1-Z5, default Z3)
+            hr_zone: Target heart-rate zone (Z1-Z5, default Z3). Ignored if hr_min/hr_max are given.
+            hr_min: Optional custom target heart rate range, minimum bpm (must be given with hr_max)
+            hr_max: Optional custom target heart rate range, maximum bpm (must be given with hr_min)
         """
         try:
             workout_json = build_run_json(
@@ -365,6 +425,8 @@ def register_tools(app):
                 warmup_min=warmup_min,
                 cooldown_min=cooldown_min,
                 hr_zone=hr_zone,
+                hr_min=hr_min,
+                hr_max=hr_max,
             )
             result = garmin_client.upload_workout(workout_json)
 
@@ -425,12 +487,19 @@ def register_tools(app):
     ) -> str:
         """Create a strength workout and upload it to Garmin Connect.
 
-        Each exercise is mapped to a generic step; unsupported names fallback to
-        "Other" with the original name stored in exerciseName.
+        Each exercise becomes a reps-based step. The name is kept in the step
+        description; it is also sent as exerciseName, which Garmin only retains when
+        it matches one of its own exercise keys (e.g. "FARMERS_CARRY").
 
         Args:
             name: Workout name
-            exercises: List of dicts with keys: name, sets, reps, rest_seconds
+            exercises: List of dicts with keys: name, sets, reps, rest_seconds and an
+                optional category. Category is omitted from the payload when not
+                given; Garmin accepts that. When given it must be one of Garmin's
+                exercise categories (e.g. SQUAT, DEADLIFT, PUSH_UP, CARRY, SLED) —
+                anything else, including "UNASSIGNED" and "OTHER", is rejected with
+                400 Invalid category. Full list:
+                https://connect.garmin.com/web-data/exercises/Exercises.json
         """
         try:
             workout_json = build_strength_json(name=name, exercises=exercises)

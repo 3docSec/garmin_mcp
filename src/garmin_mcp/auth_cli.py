@@ -19,15 +19,9 @@ from garmin_mcp.token_utils import (
     token_exists,
     validate_tokens,
     get_token_info,
+    resolve_token_path,
+    secure_token_dir as _secure_token_dir,
 )
-
-
-def _secure_token_dir(path: str) -> None:
-    """Set owner-only permissions on a token directory and all files inside it."""
-    os.chmod(path, 0o700)
-    for entry in os.scandir(path):
-        if entry.is_file():
-            os.chmod(entry.path, 0o600)
 
 
 def get_mfa() -> str:
@@ -128,6 +122,9 @@ def authenticate(token_path: str, token_base64_path: str, force_reauth: bool = F
     """
     import io
 
+    token_path = resolve_token_path(token_path)
+    token_base64_path = resolve_token_path(token_base64_path)
+
     # Check if tokens already exist and are valid
     if not force_reauth and token_exists(token_path):
         print(f"\nChecking existing tokens in '{token_path}'...")
@@ -171,20 +168,18 @@ def authenticate(token_path: str, token_base64_path: str, force_reauth: bool = F
 
         # Save tokens to directory
         garmin.client.dump(token_path)
-        expanded_token_path = os.path.expanduser(token_path)
-        _secure_token_dir(expanded_token_path)
-        print(f"\n✓ OAuth tokens saved to: {expanded_token_path}")
+        _secure_token_dir(token_path)
+        print(f"\n✓ OAuth tokens saved to: {token_path}")
 
         # Save tokens as base64
-        token_json_path = os.path.join(expanded_token_path, "garmin_tokens.json")
-        expanded_base64_path = os.path.expanduser(token_base64_path)
+        token_json_path = os.path.join(token_path, "garmin_tokens.json")
         with open(token_json_path, "r") as f:
             token_data = f.read()
         token_base64 = base64.b64encode(token_data.encode()).decode()
-        with open(expanded_base64_path, "w") as token_file:
+        with open(token_base64_path, "w") as token_file:
             token_file.write(token_base64)
-        os.chmod(expanded_base64_path, 0o600)
-        print(f"✓ OAuth tokens (base64) saved to: {expanded_base64_path}")
+        os.chmod(token_base64_path, 0o600)
+        print(f"✓ OAuth tokens (base64) saved to: {token_base64_path}")
 
         # Verify tokens work with an independent token-based login. The login
         # above runs with return_on_mfa=True, which skips profile loading, so a

@@ -25,7 +25,7 @@
     "garmin-connect"
   ],
   "server": {
-    "type": "uv",
+    "type": "python",
     "entry_point": "garmin_mcp",
     "mcp_config": {
       "command": "uvx",
@@ -49,7 +49,7 @@
       "title": "Token storage directory",
       "description": "Directory where your Garmin OAuth tokens are stored. You must run garmin-mcp-auth once in a terminal to generate these tokens before using the server.",
       "required": false,
-      "default": "${HOME}/.garminconnect"
+      "default": "~/.garminconnect"
     },
     "garmin_email": {
       "type": "string",

@@ -138,7 +138,16 @@ Returns: `{"status": "success", "workout_id": 1234567890, ...}`
 
 ### `create_strength_workout`
 
-Creates a strength workout from a list of exercises. Unknown names fall back to a generic step with the original name preserved.
+Creates a strength workout from a list of exercises. Each becomes a reps-based step, with the
+name kept in the step description. The name is also sent as `exerciseName`, but Garmin only
+retains that when it matches one of its own exercise keys (e.g. `FARMERS_CARRY`) — any other
+value is accepted and then stored empty.
+
+`category` is optional and passed straight through. Omit it and the key is left out of the
+payload entirely, which Garmin accepts. Supply it and it must be one of Garmin's exercise
+categories — anything else, including `OTHER` and `UNASSIGNED`, is rejected with
+`400 - Invalid category`. The full list is published at
+[`Exercises.json`](https://connect.garmin.com/web-data/exercises/Exercises.json).
 
 ```json
 {
@@ -146,7 +155,8 @@ Creates a strength workout from a list of exercises. Unknown names fall back to 
   "exercises": [
     {"name": "Sentadillas", "sets": 3, "reps": 12, "rest_seconds": 90},
     {"name": "Flexiones",   "sets": 3, "reps": 15, "rest_seconds": 60},
-    {"name": "Peso muerto", "sets": 3, "reps": 10, "rest_seconds": 90}
+    {"name": "Peso muerto", "sets": 3, "reps": 10, "rest_seconds": 90},
+    {"name": "Farmers Carry 40m", "sets": 3, "reps": 1, "rest_seconds": 90, "category": "CARRY"}
   ]
 }
 ```
@@ -239,7 +249,9 @@ treats the numeric ID as authoritative: a mismatched payload such as
 `pace.zone`, because ID `6` means `pace.zone`.
 
 For a custom heart-rate range, use target type ID `4` with `heart.rate.zone` and
-put the bpm range in `targetValueOne` / `targetValueTwo`:
+put the bpm range in `targetValueOne` / `targetValueTwo`. These value fields
+belong on the workout step, alongside `targetType`; do not nest them inside the
+`targetType` object:
 
 ```json
 {
@@ -252,6 +264,26 @@ put the bpm range in `targetValueOne` / `targetValueTwo`:
 }
 ```
 
+The same shape applies to a custom running pace range. Pace bounds use meters
+per second:
+
+```json
+{
+  "targetType": {
+    "workoutTargetTypeId": 6,
+    "workoutTargetTypeKey": "pace.zone"
+  },
+  "targetValueOne": 1.9607843,
+  "targetValueTwo": 2.0833333
+}
+```
+
+That example represents `8:00–8:30 min/km`. The lower numeric bound is listed
+first for consistency with the heart-rate example; Garmin normalizes either
+bound order. Garmin silently discards values nested inside `targetType`, leaving
+a pace target with no active range. The upload tools repair that unambiguous
+nesting mistake, but reject the request if nested and step-level values conflict.
+
 For a named Garmin HR zone, use the same target type with `zoneNumber` instead:
 
 ```json
@@ -263,6 +295,11 @@ For a named Garmin HR zone, use the same target type with `zoneNumber` instead:
   "zoneNumber": 3
 }
 ```
+
+Use either `zoneNumber` or `targetValueOne` / `targetValueTwo` on a target, not
+both. Garmin treats the named zone as authoritative and silently discards a
+coexisting custom range, so the upload tools reject that ambiguous shape.
+
 ## One-click Install (Claude Desktop)
 
 The easiest way to add this server to Claude Desktop is via the `.dxt` Desktop Extension file — no JSON editing required.
@@ -397,7 +434,7 @@ File-based secrets are useful in certain environments, such as inside a Docker c
 By default the server communicates over **stdio**, which is what Claude Desktop, the MCP Inspector, and most local clients expect. To serve over **HTTP** instead (e.g. when running in a container or Kubernetes), set the transport via environment variables:
 
 - `GARMIN_MCP_TRANSPORT`: `stdio` (default), `streamable-http`, or `sse`
-- `GARMIN_MCP_HOST`: bind address for HTTP transports (default `0.0.0.0`)
+- `GARMIN_MCP_HOST`: bind address for HTTP transports (default `127.0.0.1`; set to `0.0.0.0` only when the endpoint is fronted by an authenticating reverse proxy)
 - `GARMIN_MCP_PORT`: bind port for HTTP transports (default `8000`)
 
 ```bash
