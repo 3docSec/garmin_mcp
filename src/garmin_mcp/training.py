@@ -20,6 +20,27 @@ def configure(client):
     _activity_type_cache = None  # Reset cache when client changes
 
 
+def _vo2max_for_date(client, date_str: str) -> Optional[float]:
+    """Daily generic VO2 max for `date_str`, read from the maxmet metrics endpoint.
+
+    Garmin serves the FirstBeat VO2 max estimate from get_max_metrics()
+    (metrics-service/maxmet), under generic.vo2MaxValue. The training-status
+    endpoint's mostRecentVO2Max field is empty on many device/account
+    combinations, so it must not be the source for VO2 max. Returns None when
+    there is genuinely no estimate for the day (e.g. a not-yet-synced today).
+    """
+    metrics = client.get_max_metrics(date_str)
+    # The endpoint returns a single-element list; tolerate a bare dict too.
+    if isinstance(metrics, list):
+        record = metrics[0] if metrics else {}
+    elif isinstance(metrics, dict):
+        record = metrics
+    else:
+        record = {}
+    generic = (record.get("generic") or {}) if isinstance(record, dict) else {}
+    return generic.get("vo2MaxValue")
+
+
 def _get_activity_type_mapping() -> Dict[int, str]:
     """Get or build a cached mapping of activity type IDs to names"""
     global _activity_type_cache
@@ -507,9 +528,21 @@ def register_tools(app):
 
             acwr_data = (device_data.get("acuteTrainingLoadDTO") or {})
 
-            # VO2 Max data
+            # VO2 Max data. mostRecentVO2Max is empty on many device/account
+            # combinations; fall back to the maxmet endpoint (the source used by
+            # get_vo2max_trend) so vo2_max isn't silently None when it exists.
             vo2_data = (status.get("mostRecentVO2Max") or {}).get("generic") or {}
             cycling_vo2_data = (status.get("mostRecentVO2Max") or {}).get("cycling") or {}
+            if vo2_data.get("vo2MaxValue") is None:
+                try:
+                    max_metrics = garmin_client.get_max_metrics(date)
+                    record = (max_metrics[0] if isinstance(max_metrics, list) and max_metrics
+                              else max_metrics if isinstance(max_metrics, dict) else {})
+                    if isinstance(record, dict):
+                        vo2_data = record.get("generic") or vo2_data
+                        cycling_vo2_data = record.get("cycling") or cycling_vo2_data
+                except Exception:
+                    pass
 
             # Training load balance
             load_balance = (status.get("mostRecentTrainingLoadBalance") or {})
@@ -1019,15 +1052,17 @@ def register_tools(app):
         while current <= end:
             date_str = current.isoformat()
             try:
-                data = garmin_client.get_training_status(date_str)
-                if data:
-                    vo2_data = (data.get("mostRecentVO2Max") or {}).get("generic") or {}
-                    vo2 = vo2_data.get("vo2MaxValue")
-                    if vo2 is not None:
-                        vo2_rounded = round(vo2, 1)
-                        if vo2_rounded != last_vo2:  # deduplicate unchanged values
-                            trend.append({"date": date_str, "vo2_max": vo2_rounded})
-                            last_vo2 = vo2_rounded
+                # VO2 max lives in the maxmet metrics endpoint, not training status.
+                # get_training_status().mostRecentVO2Max is empty on many device/account
+                # combinations (returns None even when VO2 max exists), which silently
+                # produced "No VO2 max data found". get_max_metrics carries the daily
+                # FirstBeat estimate under generic.vo2MaxValue.
+                vo2 = _vo2max_for_date(garmin_client, date_str)
+                if vo2 is not None:
+                    vo2_rounded = round(vo2, 1)
+                    if vo2_rounded != last_vo2:  # deduplicate unchanged values
+                        trend.append({"date": date_str, "vo2_max": vo2_rounded})
+                        last_vo2 = vo2_rounded
             except Exception:
                 pass
             current += datetime.timedelta(days=1)

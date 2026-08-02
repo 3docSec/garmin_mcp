@@ -398,3 +398,55 @@ async def test_get_training_status_no_cycling_vo2_when_absent(app_with_training,
         assert "cycling_vo2_max_precise" not in data
     except (json.JSONDecodeError, AttributeError):
         assert "cycling_vo2_max" not in text
+
+
+# --- VO2 max source regression (maxmet, not training status) --------------------
+# get_training_status().mostRecentVO2Max is empty on many device/account combos,
+# so VO2 max must be read from get_max_metrics() (metrics-service/maxmet). These
+# lock in that source; the prior code read training status and silently returned
+# "No VO2 max data found" when maxmet held the real estimate.
+_MOCK_MAX_METRICS = [
+    {
+        "generic": {"vo2MaxValue": 48.0, "vo2MaxPreciseValue": 48.4},
+        "cycling": None,
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_get_vo2max_trend_reads_from_max_metrics(app_with_training, mock_garmin_client):
+    """VO2 max trend must come from get_max_metrics, even when training status is empty."""
+    mock_garmin_client.get_training_status.return_value = {}  # empty, as seen live
+    mock_garmin_client.get_max_metrics.return_value = _MOCK_MAX_METRICS
+
+    result = await app_with_training.call_tool(
+        "get_vo2max_trend",
+        {"start_date": "2026-07-29", "end_date": "2026-07-31"},
+    )
+
+    text = result[0][0].text if result and result[0] else str(result)
+    assert "No VO2 max data found" not in text
+    data = json.loads(text)
+    assert data["latest_vo2_max"] == 48.0
+    assert data["trend"] and data["trend"][0]["vo2_max"] == 48.0
+    mock_garmin_client.get_max_metrics.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_get_training_status_vo2max_falls_back_to_max_metrics(
+    app_with_training, mock_garmin_client
+):
+    """When mostRecentVO2Max is absent, vo2_max should fall back to get_max_metrics."""
+    status_without_vo2 = {"latestTrainingStatusData": {}}  # no mostRecentVO2Max
+    mock_garmin_client.get_training_status.return_value = status_without_vo2
+    mock_garmin_client.get_max_metrics.return_value = _MOCK_MAX_METRICS
+
+    result = await app_with_training.call_tool(
+        "get_training_status",
+        {"date": "2026-07-31"},
+    )
+
+    text = result[0][0].text if result and result[0] else str(result)
+    data = json.loads(text)
+    assert data.get("vo2_max") == 48.0
+    assert data.get("vo2_max_precise") == 48.4
