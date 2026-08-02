@@ -50,15 +50,38 @@ _MODULE_NAMES = [
 _MODULES = [importlib.import_module(f"garmin_mcp.{n}") for n in _MODULE_NAMES]
 
 
+class _LazyGarmin:
+    """Authenticate to Garmin on first use, not at import.
+
+    Horizon runs `fastmcp inspect main.py:mcp` during the build to read tool
+    schemas; that import must succeed without the Garmin token secret (which may
+    only be present at runtime). Registering tools never touches the client, so
+    we defer login until the first actual API call.
+    """
+
+    def __init__(self) -> None:
+        self._real = None
+
+    def _client(self):
+        if self._real is None:
+            c = gm.init_api(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
+            if c is None:
+                raise RuntimeError(
+                    "Garmin authentication unavailable. Set GARMIN_TOKEN_B64 "
+                    "(run `garmin-mcp-auth` locally, then base64 the "
+                    "~/.garminconnect/garmin_tokens.json file)."
+                )
+            self._real = gm._GarminProxy(c)
+        return self._real
+
+    def __getattr__(self, name):
+        # Only reached for Garmin API methods (real attrs resolve normally),
+        # so any tool call triggers a lazy login here.
+        return getattr(self._client(), name)
+
+
 def _build() -> FastMCP:
-    client = gm.init_api(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
-    if client is None:
-        raise RuntimeError(
-            "Garmin authentication unavailable. Set GARMIN_TOKEN_B64 "
-            "(run `garmin-mcp-auth` locally, then base64 the "
-            "~/.garminconnect/garmin_tokens.json file)."
-        )
-    client = gm._GarminProxy(client)
+    client = _LazyGarmin()
     for module in _MODULES:
         module.configure(client)
 

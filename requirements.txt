@@ -4,3 +4,8 @@ requests==2.33.0
 mcp>=1.23.0
 fitparse>=1.2.0
 fastmcp>=2
+# fastmcp needs pydantic-settings at import time. Horizon's build image ships a
+# pre-baked fastmcp that already satisfies `fastmcp>=2`, so pip skips it and
+# never pulls this transitive dep — declare it explicitly so `fastmcp inspect`
+# can import fastmcp during the build.
+pydantic-settings>=2
