@@ -28,14 +28,36 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 # The token must exist on disk BEFORE importing garmin_mcp, which reads
 # GARMINTOKENS at import time. Materialize it from the env secret.
+# _TOKEN_DIAG records exactly what happened so auth failures are diagnosable
+# from the error message surfaced to Claude (no log-diving needed).
 _b64 = os.getenv("GARMIN_TOKEN_B64")
-if _b64:
-    _dir = pathlib.Path(os.getenv("GARMINTOKENS") or "/tmp/garmintokens")
-    _dir.mkdir(parents=True, exist_ok=True)
-    (_dir / "garmin_tokens.json").write_text(
-        base64.b64decode(_b64).decode("utf-8"), encoding="utf-8"
+if not _b64:
+    _TOKEN_DIAG = (
+        "GARMIN_TOKEN_B64 is NOT set in this deployment's environment. "
+        "Add it as a RUNTIME env var/secret on the deployment serving this URL "
+        "(check the exact name — GARMIN_TOKEN_B64), then redeploy."
     )
-    os.environ["GARMINTOKENS"] = str(_dir)
+else:
+    try:
+        _dir = pathlib.Path(os.getenv("GARMINTOKENS") or "/tmp/garmintokens")
+        _dir.mkdir(parents=True, exist_ok=True)
+        _tok_path = _dir / "garmin_tokens.json"
+        _tok_path.write_text(
+            base64.b64decode(_b64).decode("utf-8"), encoding="utf-8"
+        )
+        os.environ["GARMINTOKENS"] = str(_dir)
+        _TOKEN_DIAG = (
+            f"GARMIN_TOKEN_B64 present ({len(_b64)} chars); wrote "
+            f"{_tok_path} ({_tok_path.stat().st_size} bytes). If auth still "
+            "fails, the token is stale/corrupt — re-mint and update the secret."
+        )
+    except Exception as _e:  # bad base64 / undecodable → wrong value pasted
+        _TOKEN_DIAG = (
+            f"GARMIN_TOKEN_B64 present ({len(_b64)} chars) but could NOT be "
+            f"decoded/written: {_e!r}. The pasted value is corrupt/truncated — "
+            "re-copy the full base64 string."
+        )
+print("[garmin-mcp token] " + _TOKEN_DIAG, file=sys.stderr, flush=True)
 
 from fastmcp import FastMCP  # noqa: E402  (Horizon-native server type)
 import garmin_mcp as gm  # noqa: E402
@@ -66,11 +88,7 @@ class _LazyGarmin:
         if self._real is None:
             c = gm.init_api(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
             if c is None:
-                raise RuntimeError(
-                    "Garmin authentication unavailable. Set GARMIN_TOKEN_B64 "
-                    "(run `garmin-mcp-auth` locally, then base64 the "
-                    "~/.garminconnect/garmin_tokens.json file)."
-                )
+                raise RuntimeError("Garmin auth failed. Diagnostic: " + _TOKEN_DIAG)
             self._real = gm._GarminProxy(c)
         return self._real
 
