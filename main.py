@@ -53,6 +53,10 @@ import sys
 
 import requests
 
+# Bump on each auth-path change so deployed error messages confirm which code is
+# live (helps tell "my fix isn't deployed" from "my fix didn't work").
+_BUILD = "auth-v2"
+
 # The package uses a src/ layout. Horizon installs third-party deps from
 # requirements.txt but not this local package, so put src/ on the path to make
 # `import garmin_mcp` work without a separate install step.
@@ -201,42 +205,75 @@ class _LazyGarmin:
            429. If Garmin demands MFA, we can't answer headlessly — raise a clear
            error telling the user to re-seed manually.
         """
-        from garminconnect import Garmin  # local import: keeps module import light
+        from garminconnect import (  # local import keeps module import light
+            Garmin,
+            GarminConnectAuthenticationError,
+            GarminConnectTooManyRequestsError,
+        )
 
         tokenstore = os.environ["GARMINTOKENS"]
+        tok_reason = "no token file on disk"
         if (pathlib.Path(tokenstore) / "garmin_tokens.json").exists():
             try:
                 g = Garmin()
                 g.login(tokenstore)  # loads + refreshes + validates; raises if dead
                 return g
             except Exception as e:  # noqa: BLE001 — fall through to credential login
-                print(f"[garmin-mcp auth] stored token unusable: {e!r}",
+                tok_reason = f"stored token rejected ({type(e).__name__}: {e})"
+                print(f"[garmin-mcp auth/{_BUILD}] {tok_reason}",
                       file=sys.stderr, flush=True)
 
         email = os.getenv("GARMIN_EMAIL")
         password = os.getenv("GARMIN_PASSWORD")
         if not (email and password):
             raise RuntimeError(
-                "Garmin token unavailable/expired and no GARMIN_EMAIL/"
-                "GARMIN_PASSWORD set for auto-relogin. " + _TOKEN_DIAG
+                f"[{_BUILD}] Garmin token unusable ({tok_reason}) and no "
+                f"GARMIN_EMAIL/GARMIN_PASSWORD set for auto-relogin. {_TOKEN_DIAG}"
             )
         if not self._acquire_login_lock():
             raise RuntimeError(
-                "Garmin token expired and an auto-relogin was attempted recently; "
-                "backing off to avoid Garmin's rate limit. Retry in a few minutes."
+                f"[{_BUILD}] Garmin token unusable ({tok_reason}); a re-login was "
+                "attempted in the last 10 min — backing off to avoid Garmin's 429. "
+                "Retry in a few minutes."
             )
-        print("[garmin-mcp auth] token dead; performing credential re-login",
-              file=sys.stderr, flush=True)
-        g = Garmin(email=email, password=password, return_on_mfa=True)
-        r1, _r2 = g.login()
-        if r1 == "needs_mfa":
+        print(f"[garmin-mcp auth/{_BUILD}] token dead ({tok_reason}); credential "
+              "re-login", file=sys.stderr, flush=True)
+
+        # Detect MFA cleanly (return_on_mfa returns a status, no exception), then
+        # do a real full login so the returned client is completely initialised.
+        try:
+            probe = Garmin(email=email, password=password, return_on_mfa=True)
+            status, _ = probe.login()
+            if status == "needs_mfa":
+                raise RuntimeError(
+                    f"[{_BUILD}] AUTO-RELOGIN BLOCKED: Garmin demanded an MFA code, "
+                    "which a headless server can't provide. Re-seed a token manually: "
+                    "run `garmin-mcp-auth` locally, set GARMIN_TOKEN_B64 + "
+                    "GARMIN_TOKEN_FORCE_SEED=1 for one deploy."
+                )
+            # Clean login succeeded; persist its tokens and reload a fully-populated
+            # client from them (a token load, not another SSO login → no 429).
+            probe.client.dump(tokenstore)
+            g = Garmin()
+            g.login(tokenstore)
+            return g
+        except RuntimeError:
+            raise
+        except GarminConnectTooManyRequestsError as e:
             raise RuntimeError(
-                "Garmin required an MFA code for a fresh login, which cannot be "
-                "entered on a headless server. Re-seed a token manually: run "
-                "`garmin-mcp-auth` locally, set GARMIN_TOKEN_B64 and "
-                "GARMIN_TOKEN_FORCE_SEED=1 for one deploy."
+                f"[{_BUILD}] AUTO-RELOGIN RATE-LIMITED (429): {e}. Garmin is "
+                "throttling logins; it will retry automatically later."
             )
-        return g
+        except GarminConnectAuthenticationError as e:
+            raise RuntimeError(
+                f"[{_BUILD}] AUTO-RELOGIN AUTH FAILED: {e}. Check GARMIN_EMAIL/"
+                "GARMIN_PASSWORD are correct."
+            )
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"[{_BUILD}] AUTO-RELOGIN FAILED ({type(e).__name__}): {e} "
+                f"(token was: {tok_reason})"
+            )
 
     @staticmethod
     def _acquire_login_lock() -> bool:
