@@ -2,20 +2,33 @@
 
 Deploy on Horizon with entrypoint  main.py:mcp
 
-Required env (set as Horizon secrets/vars):
-  GARMIN_TOKEN_B64        base64 of ~/.garminconnect/garmin_tokens.json — the
-                          INITIAL seed token (run `garmin-mcp-auth` locally, then
-                          `base64 -w0 ~/.garminconnect/garmin_tokens.json`).
+Auth env (set as Horizon secrets/vars):
+  GARMIN_EMAIL / GARMIN_PASSWORD
+                          Credentials for AUTO-RELOGIN: when the stored token is
+                          dead the server logs in and re-seeds the store by itself
+                          — no manual re-mint. Works only if the account does NOT
+                          demand an MFA code on login (headless servers can't
+                          answer MFA); if it does, the server raises a clear error
+                          asking for a manual re-seed.
+  GARMIN_TOKEN_B64        optional base64 of ~/.garminconnect/garmin_tokens.json —
+                          an INITIAL seed token so the first boot needn't log in
+                          (run `garmin-mcp-auth` locally, then
+                          `base64 -w0 ~/.garminconnect/garmin_tokens.json`). Not
+                          needed if GARMIN_EMAIL/PASSWORD are set and login works.
   GARMIN_DISABLED_TOOLS   comma-separated write tools to hide (read-only policy).
 
-Durable token persistence (strongly recommended — without it auth dies within
-days, see below):
+Durable token persistence (strongly recommended):
   UPSTASH_REDIS_REST_URL    Upstash Redis REST endpoint.
   UPSTASH_REDIS_REST_TOKEN  Upstash Redis REST token.
   GARMIN_TOKEN_KV_KEY       optional; key name (default "garmin:token").
-  GARMIN_TOKEN_FORCE_SEED   optional; set to "1" to overwrite the KV store from
-                            GARMIN_TOKEN_B64 on next boot (use when re-seeding a
-                            fresh token). Remove it after one deploy.
+  GARMIN_TOKEN_FORCE_SEED   optional; "1" overwrites the KV store from
+                            GARMIN_TOKEN_B64 on next boot. Rarely needed now that
+                            auto-relogin self-heals a stale store; remove after one
+                            deploy if used.
+
+Auth resolution order on first use: stored token (Redis → env seed) → credential
+auto-relogin. A dead token in Redis is thus self-healed by re-login (capped to one
+login per 10 min via a Redis lock, so it can't trip Garmin's 429).
 
 Why persistence is needed: Garmin ROTATES the refresh token on every refresh
 (garminconnect client.py: `self.di_refresh_token = data.get("refresh_token", ...)`).
@@ -132,8 +145,9 @@ if _token_json:
     )
 elif not _b64:
     _TOKEN_DIAG = (
-        "No token available: GARMIN_TOKEN_B64 is not set and the KV store is "
-        f"empty/off (kv={'on' if _kv_enabled() else 'off'}). Seed a token."
+        "No stored token (GARMIN_TOKEN_B64 unset and KV "
+        f"{'empty' if _kv_enabled() else 'off'}); will rely on GARMIN_EMAIL/"
+        "GARMIN_PASSWORD auto-relogin if set."
     )
 # else: decode-error diag already set above.
 print("[garmin-mcp token] " + _TOKEN_DIAG, file=sys.stderr, flush=True)
@@ -168,15 +182,71 @@ class _LazyGarmin:
 
     def _ensure(self):
         if self._proxy is None:
-            c = gm.init_api(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
-            if c is None:
-                raise RuntimeError("Garmin auth failed. Diagnostic: " + _TOKEN_DIAG)
+            c = self._authenticate()
             self._raw = c
             self._proxy = gm._GarminProxy(c)
-            # Loading may have proactively refreshed (rotating the token); persist
-            # the current one immediately so the store is never behind.
+            # Auth may have refreshed/rotated or minted a token; persist it now so
+            # the store is never behind.
             self._persist(force=True)
         return self._proxy
+
+    def _authenticate(self):
+        """Return an authenticated Garmin client, self-healing when possible.
+
+        1. Use the stored token (Redis/env seed, already on disk). garminconnect
+           refreshes it via diauth (not rate-limited).
+        2. If that token is dead AND GARMIN_EMAIL/GARMIN_PASSWORD are set, do a
+           full credential login and re-seed the store. A Redis lock caps this to
+           one login per 10 min across instances so it can never trip Garmin's
+           429. If Garmin demands MFA, we can't answer headlessly — raise a clear
+           error telling the user to re-seed manually.
+        """
+        from garminconnect import Garmin  # local import: keeps module import light
+
+        tokenstore = os.environ["GARMINTOKENS"]
+        if (pathlib.Path(tokenstore) / "garmin_tokens.json").exists():
+            try:
+                g = Garmin()
+                g.login(tokenstore)  # loads + refreshes + validates; raises if dead
+                return g
+            except Exception as e:  # noqa: BLE001 — fall through to credential login
+                print(f"[garmin-mcp auth] stored token unusable: {e!r}",
+                      file=sys.stderr, flush=True)
+
+        email = os.getenv("GARMIN_EMAIL")
+        password = os.getenv("GARMIN_PASSWORD")
+        if not (email and password):
+            raise RuntimeError(
+                "Garmin token unavailable/expired and no GARMIN_EMAIL/"
+                "GARMIN_PASSWORD set for auto-relogin. " + _TOKEN_DIAG
+            )
+        if not self._acquire_login_lock():
+            raise RuntimeError(
+                "Garmin token expired and an auto-relogin was attempted recently; "
+                "backing off to avoid Garmin's rate limit. Retry in a few minutes."
+            )
+        print("[garmin-mcp auth] token dead; performing credential re-login",
+              file=sys.stderr, flush=True)
+        g = Garmin(email=email, password=password, return_on_mfa=True)
+        r1, _r2 = g.login()
+        if r1 == "needs_mfa":
+            raise RuntimeError(
+                "Garmin required an MFA code for a fresh login, which cannot be "
+                "entered on a headless server. Re-seed a token manually: run "
+                "`garmin-mcp-auth` locally, set GARMIN_TOKEN_B64 and "
+                "GARMIN_TOKEN_FORCE_SEED=1 for one deploy."
+            )
+        return g
+
+    @staticmethod
+    def _acquire_login_lock() -> bool:
+        """True if we may attempt a credential login now (one per 10 min)."""
+        if not _kv_enabled():
+            return True
+        try:
+            return _kv_cmd("SET", _KV_KEY + ":login_lock", "1", "NX", "EX", "600") == "OK"
+        except Exception:  # noqa: BLE001 — never block auth on a lock hiccup
+            return True
 
     def _token(self):
         try:
