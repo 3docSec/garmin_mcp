@@ -3,14 +3,31 @@
 Deploy on Horizon with entrypoint  main.py:mcp
 
 Required env (set as Horizon secrets/vars):
-  GARMIN_TOKEN_B64      base64 of your ~/.garminconnect/garmin_tokens.json
-                        (run `garmin-mcp-auth` locally once, then
-                         `base64 -w0 ~/.garminconnect/garmin_tokens.json`)
-  GARMIN_DISABLED_TOOLS comma-separated write tools to hide (read-only policy)
+  GARMIN_TOKEN_B64        base64 of ~/.garminconnect/garmin_tokens.json — the
+                          INITIAL seed token (run `garmin-mcp-auth` locally, then
+                          `base64 -w0 ~/.garminconnect/garmin_tokens.json`).
+  GARMIN_DISABLED_TOOLS   comma-separated write tools to hide (read-only policy).
 
-This file only assembles the upstream tool modules onto a fastmcp v2 server;
-it contains no Garmin logic of its own, so it stays trivial to rebase on
-upstream.
+Durable token persistence (strongly recommended — without it auth dies within
+days, see below):
+  UPSTASH_REDIS_REST_URL    Upstash Redis REST endpoint.
+  UPSTASH_REDIS_REST_TOKEN  Upstash Redis REST token.
+  GARMIN_TOKEN_KV_KEY       optional; key name (default "garmin:token").
+  GARMIN_TOKEN_FORCE_SEED   optional; set to "1" to overwrite the KV store from
+                            GARMIN_TOKEN_B64 on next boot (use when re-seeding a
+                            fresh token). Remove it after one deploy.
+
+Why persistence is needed: Garmin ROTATES the refresh token on every refresh
+(garminconnect client.py: `self.di_refresh_token = data.get("refresh_token", ...)`).
+Horizon's filesystem is ephemeral and cold-starts revert to the static
+GARMIN_TOKEN_B64 snapshot — whose refresh token was already spent by an earlier
+refresh — so auth fails a few days after each deploy. Persisting the rotated
+token to Upstash lets cold-starts reload the CURRENT token and just refresh it
+(no fresh SSO login → no Garmin 429 rate-limit).
+
+This file assembles the upstream tool modules onto a fastmcp v2 server and adds
+token persistence; it contains no Garmin API logic, so it stays trivial to rebase
+on upstream.
 """
 
 from __future__ import annotations
@@ -21,42 +38,104 @@ import os
 import pathlib
 import sys
 
+import requests
+
 # The package uses a src/ layout. Horizon installs third-party deps from
 # requirements.txt but not this local package, so put src/ on the path to make
 # `import garmin_mcp` work without a separate install step.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
-# The token must exist on disk BEFORE importing garmin_mcp, which reads
-# GARMINTOKENS at import time. Materialize it from the env secret.
-# _TOKEN_DIAG records exactly what happened so auth failures are diagnosable
-# from the error message surfaced to Claude (no log-diving needed).
-_b64 = os.getenv("GARMIN_TOKEN_B64")
-if not _b64:
-    _TOKEN_DIAG = (
-        "GARMIN_TOKEN_B64 is NOT set in this deployment's environment. "
-        "Add it as a RUNTIME env var/secret on the deployment serving this URL "
-        "(check the exact name — GARMIN_TOKEN_B64), then redeploy."
+
+# ── Upstash Redis (durable token store over HTTP REST) ──────────────────────────
+_KV_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+_KV_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+_KV_KEY = os.getenv("GARMIN_TOKEN_KV_KEY", "garmin:token")
+
+
+def _kv_enabled() -> bool:
+    return bool(_KV_URL and _KV_TOKEN)
+
+
+def _kv_cmd(*args):
+    # Upstash REST: POST the command as a JSON array; response is {"result": ...}.
+    r = requests.post(
+        _KV_URL,
+        json=list(args),
+        headers={"Authorization": f"Bearer {_KV_TOKEN}"},
+        timeout=10,
     )
-else:
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+def _kv_get():
     try:
-        _dir = pathlib.Path(os.getenv("GARMINTOKENS") or "/tmp/garmintokens")
-        _dir.mkdir(parents=True, exist_ok=True)
-        _tok_path = _dir / "garmin_tokens.json"
-        _tok_path.write_text(
-            base64.b64decode(_b64).decode("utf-8"), encoding="utf-8"
-        )
-        os.environ["GARMINTOKENS"] = str(_dir)
-        _TOKEN_DIAG = (
-            f"GARMIN_TOKEN_B64 present ({len(_b64)} chars); wrote "
-            f"{_tok_path} ({_tok_path.stat().st_size} bytes). If auth still "
-            "fails, the token is stale/corrupt — re-mint and update the secret."
-        )
-    except Exception as _e:  # bad base64 / undecodable → wrong value pasted
+        return _kv_cmd("GET", _KV_KEY)
+    except Exception as e:  # noqa: BLE001 — store must never crash the server
+        print(f"[garmin-mcp kv] GET failed: {e!r}", file=sys.stderr, flush=True)
+        return None
+
+
+def _kv_set(value: str) -> bool:
+    try:
+        _kv_cmd("SET", _KV_KEY, value)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[garmin-mcp kv] SET failed: {e!r}", file=sys.stderr, flush=True)
+        return False
+
+
+# ── Materialize the token BEFORE importing garmin_mcp (it reads GARMINTOKENS at
+#    import). Prefer the persisted (rotated) token; fall back to the env seed. ────
+_b64 = os.getenv("GARMIN_TOKEN_B64")
+_force_seed = os.getenv("GARMIN_TOKEN_FORCE_SEED", "").lower() in ("1", "true", "yes")
+_dir = pathlib.Path(os.getenv("GARMINTOKENS") or "/tmp/garmintokens")
+_dir.mkdir(parents=True, exist_ok=True)
+_tok_path = _dir / "garmin_tokens.json"
+os.environ["GARMINTOKENS"] = str(_dir)
+
+_token_json = None
+_source = None
+
+# 1. Prefer the durable store (the current, post-rotation token).
+if _kv_enabled() and not _force_seed:
+    _token_json = _kv_get()
+    if _token_json:
+        _source = "kv"
+
+# 2. Fall back to the static env seed (first boot, empty store, or forced reseed).
+if (not _token_json or _force_seed) and _b64:
+    try:
+        _token_json = base64.b64decode(_b64).decode("utf-8")
+        _source = "env-seed"
+    except Exception as _e:  # bad base64 → wrong value pasted
+        _token_json = None
         _TOKEN_DIAG = (
             f"GARMIN_TOKEN_B64 present ({len(_b64)} chars) but could NOT be "
-            f"decoded/written: {_e!r}. The pasted value is corrupt/truncated — "
-            "re-copy the full base64 string."
+            f"decoded: {_e!r}. Re-copy the full base64 string."
         )
+
+if _token_json:
+    _tok_path.write_text(_token_json, encoding="utf-8")
+    # Seed/overwrite the store when we used the env seed so future boots (and
+    # other hosts) share the same starting point.
+    if _source == "env-seed" and _kv_enabled():
+        _kv_set(_token_json)
+    _kv_state = (
+        "on" if _kv_enabled()
+        else "OFF (no persistence; set UPSTASH_REDIS_REST_URL/TOKEN or auth dies "
+             "on cold-start)"
+    )
+    _TOKEN_DIAG = (
+        f"token loaded from {_source} ({len(_token_json)} bytes) -> {_tok_path}; "
+        f"kv={_kv_state}"
+    )
+elif not _b64:
+    _TOKEN_DIAG = (
+        "No token available: GARMIN_TOKEN_B64 is not set and the KV store is "
+        f"empty/off (kv={'on' if _kv_enabled() else 'off'}). Seed a token."
+    )
+# else: decode-error diag already set above.
 print("[garmin-mcp token] " + _TOKEN_DIAG, file=sys.stderr, flush=True)
 
 from fastmcp import FastMCP  # noqa: E402  (Horizon-native server type)
@@ -73,29 +152,59 @@ _MODULES = [importlib.import_module(f"garmin_mcp.{n}") for n in _MODULE_NAMES]
 
 
 class _LazyGarmin:
-    """Authenticate to Garmin on first use, not at import.
+    """Authenticate to Garmin on first use, and persist rotated tokens.
 
-    Horizon runs `fastmcp inspect main.py:mcp` during the build to read tool
-    schemas; that import must succeed without the Garmin token secret (which may
-    only be present at runtime). Registering tools never touches the client, so
-    we defer login until the first actual API call.
+    Import must succeed without credentials (Horizon runs `fastmcp inspect` at
+    build time), so login is deferred to the first API call. After each call we
+    write the current token back to the KV store, because garminconnect rotates
+    the refresh token during refreshes — persisting it is what lets cold-starts
+    survive (see module docstring).
     """
 
     def __init__(self) -> None:
-        self._real = None
+        self._raw = None      # underlying Garmin object (for dumps())
+        self._proxy = None    # gm._GarminProxy (surfaces auth/rate errors)
+        self._saved = None    # last token string written to the store
 
-    def _client(self):
-        if self._real is None:
+    def _ensure(self):
+        if self._proxy is None:
             c = gm.init_api(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
             if c is None:
                 raise RuntimeError("Garmin auth failed. Diagnostic: " + _TOKEN_DIAG)
-            self._real = gm._GarminProxy(c)
-        return self._real
+            self._raw = c
+            self._proxy = gm._GarminProxy(c)
+            # Loading may have proactively refreshed (rotating the token); persist
+            # the current one immediately so the store is never behind.
+            self._persist(force=True)
+        return self._proxy
+
+    def _token(self):
+        try:
+            return self._raw.client.dumps()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _persist(self, force: bool = False) -> None:
+        if not _kv_enabled():
+            return
+        cur = self._token()
+        if cur and (force or cur != self._saved):
+            if _kv_set(cur):
+                self._saved = cur
 
     def __getattr__(self, name):
-        # Only reached for Garmin API methods (real attrs resolve normally),
-        # so any tool call triggers a lazy login here.
-        return getattr(self._client(), name)
+        # Only reached for Garmin API methods (real attrs resolve normally).
+        proxy = self._ensure()
+        attr = getattr(proxy, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            self._persist()  # capture any refresh-rotation from this call
+            return result
+
+        return wrapped
 
 
 def _build() -> FastMCP:
