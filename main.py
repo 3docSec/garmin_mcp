@@ -55,7 +55,7 @@ import requests
 
 # Bump on each auth-path change so deployed error messages confirm which code is
 # live (helps tell "my fix isn't deployed" from "my fix didn't work").
-_BUILD = "auth-v2"
+_BUILD = "auth-v3"
 
 # The package uses a src/ layout. Horizon installs third-party deps from
 # requirements.txt but not this local package, so put src/ on the path to make
@@ -239,40 +239,38 @@ class _LazyGarmin:
         print(f"[garmin-mcp auth/{_BUILD}] token dead ({tok_reason}); credential "
               "re-login", file=sys.stderr, flush=True)
 
-        # Detect MFA cleanly (return_on_mfa returns a status, no exception), then
-        # do a real full login so the returned client is completely initialised.
+        # Detect MFA reliably: a prompt_mfa callback fires iff Garmin demands a
+        # code. Setting the flag before aborting means we can tell "MFA required"
+        # from "wrong credentials" even after the library re-wraps the exception.
+        # On success (no MFA) this is a full login, so the client is fully usable.
+        mfa_asked = {"v": False}
+
+        def _mfa_prompt():
+            mfa_asked["v"] = True
+            raise RuntimeError("__MFA_REQUIRED__")  # abort the login
+
         try:
-            probe = Garmin(email=email, password=password, return_on_mfa=True)
-            status, _ = probe.login()
-            if status == "needs_mfa":
-                raise RuntimeError(
-                    f"[{_BUILD}] AUTO-RELOGIN BLOCKED: Garmin demanded an MFA code, "
-                    "which a headless server can't provide. Re-seed a token manually: "
-                    "run `garmin-mcp-auth` locally, set GARMIN_TOKEN_B64 + "
-                    "GARMIN_TOKEN_FORCE_SEED=1 for one deploy."
-                )
-            # Clean login succeeded; persist its tokens and reload a fully-populated
-            # client from them (a token load, not another SSO login → no 429).
-            probe.client.dump(tokenstore)
-            g = Garmin()
-            g.login(tokenstore)
+            g = Garmin(email=email, password=password, prompt_mfa=_mfa_prompt)
+            g.login()
             return g
-        except RuntimeError:
-            raise
         except GarminConnectTooManyRequestsError as e:
             raise RuntimeError(
                 f"[{_BUILD}] AUTO-RELOGIN RATE-LIMITED (429): {e}. Garmin is "
                 "throttling logins; it will retry automatically later."
             )
-        except GarminConnectAuthenticationError as e:
-            raise RuntimeError(
-                f"[{_BUILD}] AUTO-RELOGIN AUTH FAILED: {e}. Check GARMIN_EMAIL/"
-                "GARMIN_PASSWORD are correct."
-            )
         except Exception as e:  # noqa: BLE001
+            if mfa_asked["v"]:
+                raise RuntimeError(
+                    f"[{_BUILD}] AUTO-RELOGIN BLOCKED: Garmin demanded an MFA code, "
+                    "which a headless server can't provide. Auto-relogin is not "
+                    "viable for this account — re-seed a token manually: run "
+                    "`garmin-mcp-auth` locally, set GARMIN_TOKEN_B64 + "
+                    "GARMIN_TOKEN_FORCE_SEED=1 for one deploy."
+                )
             raise RuntimeError(
-                f"[{_BUILD}] AUTO-RELOGIN FAILED ({type(e).__name__}): {e} "
-                f"(token was: {tok_reason})"
+                f"[{_BUILD}] AUTO-RELOGIN FAILED ({type(e).__name__}): {e}. "
+                "Check GARMIN_EMAIL/GARMIN_PASSWORD are correct "
+                f"(stored token was: {tok_reason})."
             )
 
     @staticmethod
